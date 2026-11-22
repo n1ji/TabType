@@ -27,7 +27,12 @@ final class Engine {
 
     /// Fallback context buffer, used when the Accessibility API can't provide the
     /// focused field's text. Rebuilt on focus change.
-    private var buffer = ""
+    private var buffer = "" {
+        didSet { if buffer.isEmpty { autocorrect.caretJumped(bufferCount: 0) } }
+    }
+    /// What autocorrect may touch (see `AutocorrectState`); reverted words persist.
+    private var autocorrect = AutocorrectState(
+        rejected: Set(UserDefaults.standard.stringArray(forKey: "autocorrectRejectedWords") ?? []))
     /// The ghost suggestion's lifecycle (type-through, Tab remainders, stale and
     /// repeated results) — see `SuggestionSession`.
     private var session = SuggestionSession() { didSet { refreshHotKeys() } }
@@ -334,13 +339,25 @@ final class Engine {
             MainActor.assumeIsolated {
                 let hadSuggestion = self.currentSuggestion != nil
                 self.dropPendingEdits()   // a click can move the caret
-                // Even without a ghost, a click can move text focus (e.g. web
-                // navigation) — the accessory button must follow.
-                guard hadSuggestion || self.settings.showAccessoryButton else { return }
+                self.autocorrect.caretJumped(bufferCount: self.buffer.count)
                 let beforeElement = AccessibilityBridge.focusedElement()
                 let beforeCaret = beforeElement.flatMap { AccessibilityBridge.caretOffset(of: $0) }
                 let beforeLen = beforeElement.flatMap { AccessibilityBridge.stringValue(of: $0)?.count }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    // A click that put the caret somewhere new in a text field
+                    // predicts there, like typing would.
+                    // shortcut: apps that report no caret offset (some Electron
+                    // fields) can't tell a caret move from a plain click; they
+                    // re-predict on the next keystroke instead.
+                    let movedTo = AccessibilityBridge.focusedElement()
+                    let movedCaret = movedTo.flatMap { AccessibilityBridge.caretOffset(of: $0) }
+                    let otherField = movedTo.map { e in beforeElement.map { !CFEqual($0, e) } ?? true } ?? false
+                    defer {
+                        if movedCaret != nil, movedCaret != beforeCaret || otherField { self.predictAfterCaretMove() }
+                    }
+                    // Even without a ghost, a click can move text focus (e.g. web
+                    // navigation) — the accessory button must follow.
+                    guard hadSuggestion || self.settings.showAccessoryButton else { return }
                     // A click is exactly when text focus appears/disappears with no
                     // keystroke — re-evaluate the accessory button either way.
                     self.updateAccessoryButton()
@@ -841,6 +858,7 @@ final class Engine {
         if navKeys.contains(keyCode) {
             if inlineCommand.isActive { inlineCommand.cancel() }
             dropPendingEdits()   // the caret moves, or the message is sent
+            autocorrect.caretJumped(bufferCount: buffer.count)
             lockedContext = nil   // a sent message changes the conversation
             // Return in a chat app usually SENDS — remember what was said, so the
             // next suggestion can continue the user's side of the conversation.
@@ -851,6 +869,8 @@ final class Engine {
                 }
             }
             clearSuggestion()
+            // Arrows, Home/End, Page Up/Down: predict where the caret lands.
+            if keyCode != 36 { predictAfterCaretMove() }
             return .passthrough
         }
         return .notControl
@@ -915,6 +935,10 @@ final class Engine {
 
         // Maintain fallback buffer.
         if isDeletion {
+            if let word = autocorrect.deleted(bufferCountBefore: buffer.count) {
+                UserDefaults.standard.set(Array(autocorrect.rejected.prefix(500)), forKey: "autocorrectRejectedWords")
+                Log.shared.debug("autocorrect: \(word) reverted — won't correct it again")
+            }
             if !buffer.isEmpty { buffer.removeLast() }
         } else {
             buffer += chars
@@ -1264,12 +1288,35 @@ final class Engine {
         poll(0.02)
     }
 
+    /// The caret moved without typing (arrow keys, Home/End, a click): predict
+    /// for where it landed once the app has moved it.
+    private func predictAfterCaretMove() {
+        let bundleId = AccessibilityBridge.frontmostBundleId()
+        guard router.current.isReady, !inlineCommand.isActive,
+              AppPolicyStore.policy(forBundleId: bundleId).isEnabled,
+              settings.isEnabled(forBundleId: bundleId) else { return }
+        debounceWork?.cancel()
+        scheduleToken += 1
+        let token = scheduleToken
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, token == self.scheduleToken else { return }
+            self.hostBaselineLen = nil       // no keystroke to wait for
+            self.lastPredictedPrompt = ""    // same text, new caret
+            self.runPrediction()
+        }
+        debounceWork = work
+        // A held arrow key repeats faster than this: only the resting place predicts.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+    }
+
     /// If the token just before the boundary is a known emoticon (":-)"), replace it
     /// with the emoji. Returns true if a replacement was made.
     private func replaceEmoticon(boundary: Character) -> Bool {
-        guard buffer.count >= 2 else { return false }
-        let withoutBoundary = String(buffer.dropLast())
+        let fresh = String(buffer.dropFirst(min(autocorrect.floor, buffer.count)))
+        guard fresh.count >= 2 else { return false }
+        let withoutBoundary = String(fresh.dropLast())
         guard let token = withoutBoundary.split(whereSeparator: { $0 == " " || $0 == "\n" }).last,
+              token.count < withoutBoundary.count || autocorrect.floor == 0,
               let emoji = Emoticons.emoji(for: String(token)) else { return false }
         let deleteCount = token.count + 1   // token + boundary
         buffer = String(buffer.dropLast(deleteCount)) + emoji + String(boundary)
@@ -1286,12 +1333,8 @@ final class Engine {
     /// still intact (the user hasn't typed past it).
     private func maybeAutocorrect() {
         // buffer currently ends with the boundary char just typed.
-        guard buffer.count >= 4 else { return }
-        let withoutBoundary = String(buffer.dropLast())
-        guard let word = withoutBoundary.split(whereSeparator: { $0 == " " || $0 == "\n" }).last,
-              word.count >= 3, word.allSatisfy({ $0.isLetter }) else { return }
-        let wordStr = String(word)
-        let boundary = String(buffer.last!)
+        guard let (wordStr, boundaryChar) = autocorrect.candidate(in: buffer) else { return }
+        let boundary = String(boundaryChar)
         let expectedSuffix = wordStr + boundary
 
         // Don't touch secure fields.
@@ -1300,8 +1343,17 @@ final class Engine {
         SpellChecker.shared.correct(wordStr, language: settings.autocorrectLanguage) { [weak self] corrected in
             guard let self, let corrected else { return }
             guard self.buffer.hasSuffix(expectedSuffix) else { return }  // tail unchanged
+            // Where the field can say, the text before the caret must really end
+            // with the word: backspacing anything else mangles its neighbours.
+            if let f = AccessibilityBridge.focusedElement(), let caret = AccessibilityBridge.caretOffset(of: f),
+               let full = AccessibilityBridge.stringValue(of: f),
+               !AccessibilityBridge.split(full, caretUTF16: caret).before.hasSuffix(expectedSuffix) {
+                Log.shared.debug("autocorrect: skipped \(wordStr) — the field doesn't end with it")
+                return
+            }
             let deleteCount = expectedSuffix.count
             self.buffer = String(self.buffer.dropLast(deleteCount)) + corrected + boundary
+            self.autocorrect.corrected(wordStr, to: corrected, bufferCount: self.buffer.count)
             self.dropPendingEdits()   // text changed other than by typing
             TextInserter.backspace(count: deleteCount)
             TextInserter.insert(corrected + boundary, strategy: .keystroke)
