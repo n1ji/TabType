@@ -31,6 +31,9 @@ final class CommandPreviewPanel {
         label.isEditable = false
         label.drawsBackground = false
         label.maximumNumberOfLines = 1
+        label.usesSingleLineMode = true
+        label.cell?.wraps = false          // a wrapped label showed "no" of "no match"
+        label.lineBreakMode = .byClipping
         label.font = .systemFont(ofSize: 15)
 
         let container = NSView()

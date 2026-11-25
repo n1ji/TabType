@@ -65,3 +65,17 @@ final class AutocorrectStateTests: XCTestCase {
         XCTAssertEqual(state.floor, 4)
     }
 }
+
+final class EmojiTriggerTests: XCTestCase {
+    func testEmoticonsAreNotEmojiSearches() {
+        for c: Character in [")", "(", "/", "'", "|", "*", "-"] {
+            XCTAssertFalse(InlineCommandController.isEmojiNameCharacter(c, first: true), "\":\(c)\" is an emoticon")
+        }
+    }
+
+    func testEmojiNamesStayValid() {
+        for (c, first) in [("s", true), ("D", true), ("1", true), ("+", true), ("_", false), ("-", false)] as [(Character, Bool)] {
+            XCTAssertTrue(InlineCommandController.isEmojiNameCharacter(c, first: first))
+        }
+    }
+}

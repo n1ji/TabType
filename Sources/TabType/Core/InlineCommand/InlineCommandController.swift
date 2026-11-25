@@ -54,7 +54,8 @@ final class InlineCommandController {
         guard let ch = chars.last, chars.count == 1 else { return isActive }
 
         if mode == .idle {
-            if ch == ":" && settings.emojiEnabled {
+            // Like "/", ":" only starts a word: "12:30", "http:" and "Note:" aren't commands.
+            if ch == ":" && settings.emojiEnabled && isWordBoundary(lastChar) {
                 mode = .emoji; query = ""; triggerChar = ":"; generation += 1
                 refreshPreview(caretRect()); lastChar = ch; return true
             }
@@ -71,6 +72,9 @@ final class InlineCommandController {
         switch mode {
         case .emoji:
             if ch == " " || ch == ":" { cancel(); return false }  // emoji names have no spaces
+            // Emoji names are letters, digits, "_", "+", "-": anything else right
+            // after the colon is an emoticon (":)", ":(", ":/"), not a search.
+            if !Self.isEmojiNameCharacter(ch, first: query.isEmpty) { cancel(); return false }
             query.append(ch)
         case .macro:
             query.append(ch)                                       // allow spaces / -> / digits
@@ -159,6 +163,11 @@ final class InlineCommandController {
     }
 
     // MARK: - Private
+
+    nonisolated static func isEmojiNameCharacter(_ c: Character, first: Bool) -> Bool {
+        if c.isLetter || c.isNumber || c == "_" || c == "+" { return true }
+        return c == "-" && !first   // ":-)" is a nose, ":thumbs-up" isn't
+    }
 
     private func isWordBoundary(_ c: Character?) -> Bool {
         guard let c else { return true }
